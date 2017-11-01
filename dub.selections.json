@@ -2,7 +2,7 @@
 	"fileVersion": 1,
 	"versions": {
 		"colorize": "1.0.5",
-		"libdparse": "0.7.1-beta.6",
+		"dmd-semver": "7.7.0-rc.1+2.077.0-rc.1",
 		"linenoise": "1.0.0"
 	}
 }

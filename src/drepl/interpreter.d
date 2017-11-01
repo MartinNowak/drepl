@@ -14,13 +14,33 @@ struct InterpreterResult
     string stdout, stderr;
 }
 
+shared static this()
+{
+    import core.memory : GC;
+    import ddmd.astbase : ASTBase;
+    import ddmd.globals : global;
+    import ddmd.identifier : Id;
+
+    Id.initialize();
+    global._init();
+    global.params.isLinux = true;
+    global.params.is64bit = (size_t.sizeof == 8);
+    global.params.useUnitTests = true;
+    // global.params.showGaggedErrors = true;
+    ASTBase.Type._init();
+    // FIXME: need to disable GC or it'll collect some of dmd's AST,
+    // e.g. stringtable entries
+    GC.disable();
+}
+
 struct Interpreter(Engine) if (isEngine!Engine)
 {
     alias IR = InterpreterResult;
+
     IR interpret(const(char)[] line)
     {
-        // ignore empty lines or comment without incomplete input
-        if (!_incomplete.data.length && (!line.length || byToken(cast(ubyte[])line).empty))
+        // ignore empty lines without incomplete input
+        if (!_incomplete.data.length && !line.length)
             return IR(IR.State.success);
 
         _incomplete.put(line);
@@ -34,17 +54,22 @@ struct Interpreter(Engine) if (isEngine!Engine)
             return IR(IR.State.error, "", "You typed two blank lines. Starting a new command.");
         }
 
-        immutable kind = classify(input);
+        immutable kind = parse(input);
+        import std.stdio;
+        writeln("kind ", kind);
         EngineResult res;
         final switch (kind)
         {
         case Kind.Decl:
+            ++modId;
             res = _engine.evalDecl(input);
             break;
         case Kind.Stmt:
+            ++modId;
             res = _engine.evalStmt(input);
             break;
         case Kind.Expr:
+            ++modId;
             res = _engine.evalExpr(input);
             break;
 
@@ -65,84 +90,103 @@ struct Interpreter(Engine) if (isEngine!Engine)
 private:
     enum Kind { Decl, Stmt, Expr, WhiteSpace, Incomplete, Error, }
 
-    import dparse.lexer, dparse.parser, dparse.rollback_allocator;
-
-    Kind classify(in char[] input)
+    Kind parse(scope const(char)[] input)
     {
-        scope cache = new StringCache(StringCache.defaultBucketCount);
-        auto tokens = getTokensForParser(cast(ubyte[])input, LexerConfig(), cache);
-        if (tokens.empty) return Kind.WhiteSpace;
+        import core.exception : RangeError;
+        import ddmd.id : Identifier;
+        import ddmd.lexer : Lexer, TOKeof;
+        import ddmd.globals : global;
 
-        auto tokenIds = tokens.map!(t => t.type)();
-        if (!tokenIds.balancedParens(tok!"{", tok!"}") ||
-            !tokenIds.balancedParens(tok!"(", tok!")") ||
-            !tokenIds.balancedParens(tok!"[", tok!"]"))
+        import std.stdio;
+        scope (exit) global.errors = 0;
+        input ~= '\0';
+
+        auto fname = format!"_mod%d.d\0"(modId);
+        auto mname = format!"_mod%d"(modId);
+
+        enum doDocComment = true;
+        enum doHdrGen = true;
+        enum commentToken = true;
+
+        scope lexer = new Lexer(fname.ptr, input.ptr, 0, input.length - 1, !doDocComment, !commentToken);
+        auto tok = lexer.nextToken; // TODO: capture dmd errors
+        if (global.errors)
+            return Kind.Error;
+        else if (tok == TOKeof)
+            return Kind.WhiteSpace;
+
+        if (!input.balancedParens('{', '}') ||
+            !input.balancedParens('(', ')') ||
+            !input.balancedParens('[', ']'))
             return Kind.Incomplete;
 
-        import std.typetuple : TypeTuple;
-        foreach (kind; TypeTuple!(Kind.Decl, Kind.Stmt, Kind.Expr))
-            if (parse!kind(tokens))
-                return kind;
+        auto id = Identifier.idPool(mname);
+        auto mod = new ASTBase.Module(fname.ptr, id, !doDocComment, !doHdrGen);
+
+        static foreach (kind; [Kind.Decl, Kind.Stmt, Kind.Expr])
+        {
+            try
+            {
+                if (parse!kind(mod, input))
+                    return kind;
+            }
+            catch (RangeError e) // `struct Foo`
+            {
+                import std.stdio;
+                writeln(e);
+            }
+        }
         return Kind.Error;
     }
 
-    bool parse(Kind kind)(in Token[] tokens)
+    bool parse(Kind kind)(ASTBase.Module m, scope const(char)[] input)
     {
-        import dparse.rollback_allocator : RollbackAllocator;
-        scope parser = new Parser();
-        RollbackAllocator allocator;
-        static bool hasErr;
-        hasErr = false;
-        parser.fileName = "drepl";
-        parser.setTokens(tokens);
-        parser.allocator = &allocator;
-        parser.messageFunction = (file, ln, col, msg, isErr) { if (isErr) hasErr = true; };
+        import ddmd.parse : Parser, PSscope;
+        import ddmd.globals : global;
+
+        enum doDocComment = true;
+        scope p = new Parser!ASTBase(m, input, !doDocComment);
+        p.nextToken();
+        auto olderrors = global.startGagging();
         static if (kind == Kind.Decl)
         {
-            do
-            {
-                if (!parser.parseDeclaration()) return false;
-            } while (parser.moreTokens());
+            enum once = true;
+            p.parseDeclDefs(once);
         }
         else static if (kind == Kind.Stmt)
-        {
-            do
-            {
-                if (!parser.parseStatement()) return false;
-            } while (parser.moreTokens());
-        }
+            auto s = p.parseStatement(PSscope);
         else static if (kind == Kind.Expr)
-        {
-            if (!parser.parseExpression() || parser.moreTokens())
-                return false;
-        }
-        return !hasErr;
+            auto e = p.parseExpression();
+        return !global.endGagging(olderrors);
     }
 
     unittest
     {
         auto intp = interpreter(echoEngine());
-        assert(intp.classify("3+2") == Kind.Expr);
+        assert(intp.parse("3+2") == Kind.Expr);
         // only single expressions
-        assert(intp.classify("3+2 foo()") == Kind.Error);
-        assert(intp.classify("3+2;") == Kind.Stmt);
+        assert(intp.parse("3+2 foo()") == Kind.Error);
+        assert(intp.parse("3+2;") == Kind.Stmt);
         // multiple statements
-        assert(intp.classify("3+2; foo();") == Kind.Stmt);
-        assert(intp.classify("struct Foo {}") == Kind.Decl);
+        assert(intp.parse("3+2; foo();") == Kind.Stmt);
+        assert(intp.parse("struct Foo {}") == Kind.Decl);
         // multiple declarations
-        assert(intp.classify("void foo() {} void bar() {}") == Kind.Decl);
+        assert(intp.parse("void foo() {} void bar() {}") == Kind.Decl);
         // can't currently mix declarations and statements
-        assert(intp.classify("void foo() {} foo();") == Kind.Error);
+        assert(intp.parse("void foo() {} foo();") == Kind.Error);
         // or declarations and expressions
-        assert(intp.classify("void foo() {} foo()") == Kind.Error);
+        assert(intp.parse("void foo() {} foo()") == Kind.Error);
         // or statments and expressions
-        assert(intp.classify("foo(); foo()") == Kind.Error);
+        assert(intp.parse("foo(); foo()") == Kind.Error);
 
-        assert(intp.classify("import std.stdio;") == Kind.Decl);
+        assert(intp.parse("import std.stdio;") == Kind.Decl);
     }
+
+    import ddmd.astbase : ASTBase;
 
     Engine _engine;
     Appender!(char[]) _incomplete;
+    size_t modId;
 }
 
 Interpreter!Engine interpreter(Engine)(auto ref Engine e) if (isEngine!Engine)
